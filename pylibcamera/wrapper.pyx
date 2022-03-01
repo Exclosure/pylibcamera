@@ -216,6 +216,7 @@ cdef extern from "libcamera/libcamera.h" namespace "libcamera":
         StreamConfiguration &at(unsigned int index);
         CC_Status validate();
 
+
 cdef class PyCameraManager:
     """
     This class wraps the camera manager surface of libcamera
@@ -273,6 +274,12 @@ cdef class PyCameraManager:
         Attempts to use the class after calling this method
         will almost certainly fail.
         """
+        if self.cm != NULL:
+            self.cm.stop()
+            self.cm = NULL
+            logging.info("Stopped camera manager")
+
+    def close(self):
         if self.cm != NULL:
             self.cm.stop()
             self.cm = NULL
