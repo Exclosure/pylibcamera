@@ -28,6 +28,8 @@ class TestLibCameraWrapper(unittest.TestCase):
             self.skipTest("No cameras available on this system")
 
     def test_get_camera(self):
+        self._skip_if_no_camera()
+
         c = self._cam_manager.get_camera(0)
 
         # Test close is idempotent
@@ -39,8 +41,8 @@ class TestLibCameraWrapper(unittest.TestCase):
 
         camera = self._cam_manager.get_camera(0)
 
-        camera.configure()
-        camera.allocate_buffer()
-        camera.create_requests()
+        camera.configure()  
+        camera.create_buffers_and_requests()
+        camera.run_cycle()
         camera.close()
 

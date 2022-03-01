@@ -289,9 +289,14 @@ cdef class PyCamera:
     cdef StreamConfiguration stream_cfg;
     cdef FrameBufferAllocator* allocator;
     cdef vector[FrameBuffer*]* buffers;
+    cdef vector[unique_ptr[Request]]* requests;
+
     mmaps = {};
     images = [];
-    cdef vector[unique_ptr[Request]]* requests;
+   
+    def __cinit__(self):
+        self.buffers = new vector[FrameBuffer*]()
+        self.requests = new vector[unique_ptr[Request]]()
 
     def configure(self):
         assert self._camera != NULL
@@ -319,21 +324,25 @@ cdef class PyCamera:
         logging.info("Using stream config #0")
         self.stream_cfg = self._camera_cfg.get().at(0)
         
-    def allocate_buffer(self):
+    def create_buffers_and_requests(self):
+        assert self.allocator == NULL
+        self.allocator = new FrameBufferAllocator(self._camera)
+
         logging.info("Allocating buffers")
         # Allocate buffers for the camera/stream pair
-        self.allocator = new FrameBufferAllocator(self._camera)
+        
         assert self.allocator.allocate(self.stream_cfg.stream()) >= 0, "Buffers did not allocate?"
         assert self.allocator.allocated(), "Buffers did not allocate?"
 
         # The unique_ptr make it so we can't reify this object...
-        self.buffers = new vector[FrameBuffer*]()
         n_buffers = self.allocator.buffers(self.stream_cfg.stream()).size()
         logging.info(f"{n_buffers} buffers allocated")
         for buff_num in range(n_buffers):
+            # Create the buffer for the request
             self.buffers.push_back(self.allocator.buffers(self.stream_cfg.stream()).at(buff_num).get())
-            b = self.allocator.buffers(self.stream_cfg.stream()).at(buff_num).get()
+            b = self.buffers.back()
 
+            # Extract its memory maps
             n_planes = b.planes().size()
             for plane_num in range(n_planes):
                 plane_fd = b.planes().at(plane_num).fd.get()
@@ -350,6 +359,10 @@ cdef class PyCamera:
                         access=mmap.ACCESS_DEFAULT,
                         offset=plane_off)
 
+            # Create the request for the buffer and load it in.
+            self.requests.push_back(self._camera.get().createRequest())
+            self.requests.back().get().addBuffer(self.stream_cfg.stream(), self.buffers.back())
+
         self.dump_mmaps()
 
     def dump_mmaps(self):
@@ -358,39 +371,23 @@ cdef class PyCamera:
             h = hashlib.sha256(mp)
             logging.info(f"FD:{fd} = {mp} hash: {h.hexdigest()}")
 
-    def create_requests(self):
-        self.requests = new vector[unique_ptr[Request]]()
-
-        n_requests = 2
-        for i in range(n_requests):
-            logging.info("Creating requests")
-            self.requests.push_back(self._camera.get().createRequest())
-
-        for i in range(n_requests):
-            assert self.requests.at(i).get() != NULL, "Failed to create request object?"
-            self.requests.at(i).get().reuse(ReuseBuffers)
-            self.requests.at(i).get().addBuffer(self.stream_cfg.stream(), self.buffers.at(0))
-            logging.info("Added buffers")
-
+    def run_cycle(self):
         logging.info("Starting camera")
         self._camera.get().start(NULL)
         
         # logging.info("Setup callback")
         # self.camera.get().requestCompleted.connect(request_callback)
 
-        for i in range(n_requests):
-            logging.info("Queueing request")
+        for i in range(self.requests.size()):
+            logging.info(f"Queueing request {i}")
             self._camera.get().queueRequest(self.requests.at(i).get())
 
         # time.sleep(10)
 
-        # for i in range(20):
-        #     for r in range(n_requests):
-        #         status = self.requests.at(r).get().status()
-        #         logging.info(f"Request status {r}: {status}")
-        #         if status == RequestComplete:
-        #             break
-        #     time.sleep(0.1)
+        for i in range(20):
+            if any(self.requests.at(r).get().status() == RequestComplete for r in range(self.requests.size())):
+                break
+            time.sleep(0.1)
 
         # logging.info("Memory maps hashes:")
         # for fd, mp in self.mmaps.items():
