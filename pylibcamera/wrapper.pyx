@@ -5,6 +5,7 @@ import hashlib
 import logging
 import numpy as np
 
+import cython
 from cython import NULL, size_t
 
 from libcpp.vector cimport vector
@@ -173,10 +174,12 @@ cdef extern from "libcamera/libcamera.h" namespace "libcamera":
         bool allocated();
         const vector[unique_ptr[FrameBuffer]] &buffers(Stream *stream);
 
-    cdef cppclass ReqSignal "libcamera::Signal<Request*>":
+    # ctypedef ReqFunc void(*func)(Request *request)
+
+    cdef cppclass Signal[R]:
         Signal()
-        void connect( void (*f_ptr)(Request* req) )
-        void disconnect( void (*f_ptr)(Request* req) )
+        void connect( void (*f_ptr)(R* req) )
+        void disconnect( void (*f_ptr)(R* req) )
 
     cdef cppclass Camera:
         int acquire();
@@ -193,7 +196,7 @@ cdef extern from "libcamera/libcamera.h" namespace "libcamera":
         const ControlList &properties() const;
         unique_ptr[Request] createRequest(uint64_t cookie = 0);
         int queueRequest(Request *request);
-        ReqSignal requestCompleted;
+        Signal[Request] requestCompleted;
 
     cdef cppclass CameraManager:
         CameraManager();
@@ -212,7 +215,6 @@ cdef extern from "libcamera/libcamera.h" namespace "libcamera":
         int size();
         StreamConfiguration &at(unsigned int index);
         CC_Status validate();
-
 
 cdef class PyCameraManager:
     """
@@ -279,7 +281,10 @@ cdef class PyCameraManager:
     def __dealloc__(self):
         self.close()
 
-cdef void request_callback(Request *request):
+
+@cython.ccall
+@cython.returns(cython.void)
+cdef void cpp_cb(Request* request):
     logging.warn("Got a callback!!!")
 
 
@@ -375,8 +380,11 @@ cdef class PyCamera:
         logging.info("Starting camera")
         self._camera.get().start(NULL)
         
-        # logging.info("Setup callback")
-        # self.camera.get().requestCompleted.connect(request_callback)
+        logging.info("Setup callback")
+        # logging.info(self._camera.get().requestCompleted.connect)
+        self._camera.get().requestCompleted.connect(cpp_cb)
+        
+        #self.camera.get().requestCompleted[0].connect(cpp_cb)
 
         for i in range(self.requests.size()):
             logging.info(f"Queueing request {i}")
@@ -395,8 +403,6 @@ cdef class PyCamera:
         #     logging.info(f"FD:{fd} = {mp} hash: {h.hexdigest()}")
 
         #     self.images.append(np.frombuffer(mp).copy())
-
-
 
         self._camera.get().stop()
         logging.info("Stopped camera")
