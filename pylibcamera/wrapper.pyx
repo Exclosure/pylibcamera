@@ -339,11 +339,13 @@ cdef class PyCameraManager:
     def __dealloc__(self):
         self.close()
 
+from libc.stdio cimport printf
+
 
 @cython.ccall
 @cython.returns(cython.void)
 cdef void cpp_cb(Request* request):
-    logging.warn("Got a callback!!!")
+    printf("Callback, seq#%i\n", request.sequence())
 
 
 cdef class PyCamera:
@@ -454,7 +456,7 @@ cdef class PyCamera:
         self._camera.get().start(NULL)
         
         logging.info("Setup callback")
-        # self._camera.get().requestCompleted.connect(cpp_cb)    
+        self._camera.get().requestCompleted.connect(cpp_cb)    
 
         for i in range(self.requests.size()):
             logging.info(f"Queueing request {i}")
