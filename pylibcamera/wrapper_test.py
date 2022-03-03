@@ -41,6 +41,7 @@ class TestLibCameraWrapper(unittest.TestCase):
         camera = self._cam_manager.get_camera(0)
 
         camera.configure()  
+        camera.dump_controls()
         camera.create_buffers_and_requests()
         camera.run_cycle()
         camera.close()

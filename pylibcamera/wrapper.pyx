@@ -8,11 +8,15 @@ import numpy as np
 import cython
 from cython import NULL, size_t
 
-from libcpp.vector cimport vector
-from libcpp.string cimport string
-from libcpp.memory cimport unique_ptr, shared_ptr
-from libcpp cimport bool
 from libc.stdint cimport uint32_t, uint64_t
+
+from libcpp cimport bool
+from libcpp.memory cimport unique_ptr, shared_ptr
+from libcpp.pair cimport pair
+from libcpp.string cimport string
+from libcpp.unordered_map cimport unordered_map
+from libcpp.vector cimport vector
+
 from posix.unistd cimport close, read, off_t
 
 
@@ -59,20 +63,65 @@ cdef extern from "libcamera/libcamera.h" namespace "libcamera":
     cdef cppclass Stream:
         const StreamConfiguration &configuration();
 
+    cdef cppclass Control:
+        Control(unsigned int id, const char *name)
+        unsigned int id();
+        const string &name();
+
     cdef cppclass ControlId:
         ControlId(unsigned int id, const string &name, ControlType type);
         unsigned int id();
         const string &name();
 
     cdef cppclass ControlValue:
+        ControlValue()
+        ControlValue(const ControlValue &other);
+        ControlValue &operator=(const ControlValue &other);
+
+        ControlType type();
+        bool isNone();
+        bool isArray();
+        size_t numElements();
+        # Span<const uint8_t> data();
+        string toString() const;
+
+    cdef cppclass ControlListMap(unordered_map[unsigned int, ControlValue]):
         pass
 
     cdef cppclass ControlList:
+        ControlList()
         # void set(unsigned int id, const ControlValue &value);
-        const ControlValue &get(unsigned int id) const;
         bool contains(unsigned int id) const;
         bool empty();
         size_t size();
+        const ControlValue &get(unsigned int id);
+        const ControlInfoMap* infoMap();
+        # cppclass iterator:
+        #     Control& operator*()
+        #     iterator operator++()
+
+    cdef cppclass ControlInfo:
+        ControlInfo(ControlValue &min, ControlValue &max, ControlValue &default);
+        # ControlInfo(Span<const ControlValue> values, const ControlValue &def);
+        # ControlInfo(std::set<bool> values, bool def);
+        ControlInfo(bool value);
+
+        ControlValue &min();
+        ControlValue &max();
+        # ControlValue &def(); # Really unsure how to wrap this one...
+        vector[ControlValue] &values();
+
+        string toString();
+
+        bool operator==(const ControlInfo &other);
+        bool operator!=(const ControlInfo &other);
+
+    cdef cppclass ControlInfoMap(unordered_map[const ControlId*, ControlInfo]):
+        ControlInfoMap();
+        ControlInfoMap(const ControlInfoMap &other);
+        cppclass iterator:
+            pair[const ControlId*, ControlInfo]& operator*()
+            iterator& operator++()
 
     cdef struct StreamConfiguration:
         # PixelFormat pixelFormat;
@@ -225,21 +274,23 @@ cdef class PyCameraManager:
     """
     cdef CameraManager* cm;
 
+    _log = logging.getLogger(__name__)
+
     def __cinit__(self):
         self.cm = new CameraManager()
         
-        logging.info(f"libcamera version: {self.version()}")
+        self._log.info(f"libcamera version: {self.version()}")
 
         rval = self.cm.start()
         assert rval == 0, f"Camera Manager did not start {rval}"
 
         n_cameras = self.cm.cameras().size()
        
-        logging.info(f"# Cameras Detected: {n_cameras}")
+        self._log.info(f"# Cameras Detected: {n_cameras}")
         cams = self.cm.cameras()
         i = 0
         for c in cams:
-            logging.info(f"- ({i}) {c.get().id().decode()}")
+            self._log.info(f"- ({i}) {c.get().id().decode()}")
             i += 1
 
     def version(self):
@@ -305,7 +356,9 @@ cdef class PyCamera:
 
     mmaps = {};
     images = [];
-   
+
+    _log = logging.getLogger(__name__)
+
     def __cinit__(self):
         self.buffers = new vector[FrameBuffer*]()
         self.requests = new vector[unique_ptr[Request]]()
@@ -314,7 +367,7 @@ cdef class PyCamera:
         assert self._camera != NULL
 
         camera_name = self._camera.get().id().decode()
-        logging.info(f"Configuration underway for: {camera_name}")
+        self._log.info(f"Configuration underway for: {camera_name}")
         
         self._camera.get().acquire()
         # Generate a configuration that support raw stills
@@ -324,23 +377,36 @@ cdef class PyCamera:
         assert self._camera_cfg.get() != NULL
 
         n_cam_configs = self._camera_cfg.get().size()
-        logging.info(f"# Camera Stream Configurations: {n_cam_configs}")
+        self._log.info(f"# Camera Stream Configurations: {n_cam_configs}")
         for i in range(n_cam_configs):
             cfg = self._camera_cfg.get().at(i)
-            logging.info(f"Config #{i} - '{cfg.toString().c_str()}'")  
+            self._log.info(f"Config #{i} - '{cfg.toString().c_str()}'")  
 
         # TODO(meawoppl) change config settings before camera.configre()
         assert self._camera_cfg.get().validate() == CC_Status.Valid
         assert self._camera.get().configure(self._camera_cfg.get()) >= 0
 
-        logging.info("Using stream config #0")
+        self._log.info("Using stream config #0")
         self.stream_cfg = self._camera_cfg.get().at(0)
+    
+    def dump_controls(self):
+        assert self._camera != NULL
         
+        # m = self._camera.get().properties().infoMap()
+        # for v in m.begin():
+        #     cython.cast(cython.uint, v.first)
+
+        # for k, v in [0]:
+        #     print(k, v)
+        # n_controls = cl.size()
+        # for n in range(n_controls):
+        #     self._log.info(cl.get(n).toString())
+
     def create_buffers_and_requests(self):
         assert self.allocator == NULL
         self.allocator = new FrameBufferAllocator(self._camera)
 
-        logging.info("Allocating buffers")
+        self._log.info("Allocating buffers")
         # Allocate buffers for the camera/stream pair
         
         assert self.allocator.allocate(self.stream_cfg.stream()) >= 0, "Buffers did not allocate?"
@@ -360,7 +426,7 @@ cdef class PyCamera:
                 plane_fd = b.planes().at(plane_num).fd.get()
                 plane_off = b.planes().at(plane_num).offset
                 plane_len = b.planes().at(plane_num).length
-                logging.info(f"Buffer #{buff_num} Plane #{plane_num} FD: {plane_fd} Offset: {plane_off} Len: {plane_len}")
+                self._log.info(f"Buffer #{buff_num} Plane #{plane_num} FD: {plane_fd} Offset: {plane_off} Len: {plane_len}")
 
                 if plane_fd not in self.mmaps:
                     self.mmaps[plane_fd] = mmap.mmap(
@@ -378,26 +444,21 @@ cdef class PyCamera:
         self.dump_mmaps()
 
     def dump_mmaps(self):
-        logging.info("Created memory maps:")
+        self._log.info("Created memory maps:")
         for fd, mp in self.mmaps.items():
             h = hashlib.sha256(mp)
-            logging.info(f"FD:{fd} = {mp} hash: {h.hexdigest()}")
+            self._log.info(f"FD:{fd} = {mp} hash: {h.hexdigest()}")
 
     def run_cycle(self):
         logging.info("Starting camera")
         self._camera.get().start(NULL)
         
         logging.info("Setup callback")
-        # logging.info(self._camera.get().requestCompleted.connect)
-        self._camera.get().requestCompleted.connect(cpp_cb)
-        
-        #self.camera.get().requestCompleted[0].connect(cpp_cb)
+        # self._camera.get().requestCompleted.connect(cpp_cb)    
 
         for i in range(self.requests.size()):
             logging.info(f"Queueing request {i}")
             self._camera.get().queueRequest(self.requests.at(i).get())
-
-        # time.sleep(10)
 
         for i in range(20):
             if any(self.requests.at(r).get().status() == RequestComplete for r in range(self.requests.size())):
@@ -412,7 +473,7 @@ cdef class PyCamera:
         #     self.images.append(np.frombuffer(mp).copy())
 
         self._camera.get().stop()
-        logging.info("Stopped camera")
+        self._log.info("Stopped camera")
 
     def close(self):
         if self.allocator != NULL:
@@ -421,7 +482,7 @@ cdef class PyCamera:
 
         if self._camera.get() != NULL:
             self._camera.get().release()
-            logging.info("Released Camera")
+            self._log.info("Released Camera")
 
 
     def __dealloc__(self):
