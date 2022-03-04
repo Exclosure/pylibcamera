@@ -21,6 +21,7 @@ class CallbackManager:
     def _rm_socket(self):
         try:
             os.remove(self._url.split("//")[1])
+            self._log.debug("Removed socket file")
         except FileNotFoundError:
             pass
 
@@ -32,7 +33,6 @@ class CallbackManager:
                 bound.set()
                 self._log.debug("Bound endopoint")
                 while not shutdown.is_set():
-                    self._log.debug("Poll, shutdownstate: %s", shutdown.is_set())
                     if skt.poll(timeout=100) == 0:
                         continue
                     payload = skt.recv()
@@ -41,7 +41,7 @@ class CallbackManager:
                         callback(payload)
                     self._log.debug("Delivered %i callbacks", len(self._callbacks))
                 skt.close(0)
-                self._log.debug("Exiting Socket Ctx")
+                self._log.debug("Exiting Socket Context")
             self._rm_socket()
         self._log.debug("Exiting Thread")
 
@@ -49,6 +49,7 @@ class CallbackManager:
         self._callbacks.append(cb)
 
     def start_callback_thread(self):
+        """Start the thread that watches for callbacks"""
         assert self._thread is None
         self._shutdown.clear()
         self._bound.clear()
@@ -61,6 +62,9 @@ class CallbackManager:
         assert self._bound.wait(timeout=1.0), "Thread did not set bind"
     
     def stop_callback_thread(self):
+        """Stop the socket watcher.
+        Raises AssertionError if the thread does not stop.
+        """
         self._log.debug("Shutdown called")
         if self._thread is None:
             return

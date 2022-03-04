@@ -18,13 +18,10 @@ class TestEventWidgit(unittest.TestCase):
         shutdown.set()
         cm._thread_run(shutdown, bound)
         assert bound.is_set()
-        
 
     def test_start_stop(self):
         cm = pylibcamera.callback.CallbackManager()
         cm.start_callback_thread()
-            # assert os.path.exists(".frame_notif")
-            # time.sleep(0.1)
         cm.stop_callback_thread()
 
     def test_start_stop_full(self):
