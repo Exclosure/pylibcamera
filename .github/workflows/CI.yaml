@@ -24,7 +24,7 @@ jobs:
         python-version: ${{ matrix.python-version }}
     - name: Install apt packages
       run: |
-        sudo apt install -y libgnutls28-dev openssl ninja-build pkg-config libboost-dev cmake libgtest-dev
+        sudo apt install -y libgnutls28-dev openssl ninja-build pkg-config libboost-dev cmake libgtest-dev sudo apt install libczmq-dev
     - name: Install apt needed to build libcamera
       run: |
         python3 -m pip install meson jinja2 ply pyyaml
