@@ -1,3 +1,4 @@
+import os
 from distutils.core import setup
 from distutils.extension import Extension
 from Cython.Build import cythonize
@@ -11,4 +12,6 @@ ext = Extension(
     extra_compile_args= ["-std=c++17"],
     language="c++")
 
-setup(name="pylibcamera", ext_modules = cythonize([ext], gdb_debug=True))
+gdb_debug = os.environ.get('GDB_DEBUG') is not None
+
+setup(name="pylibcamera", ext_modules = cythonize([ext], gdb_debug=gdb_debug))

@@ -264,7 +264,7 @@ cdef extern from "libcamera/libcamera.h" namespace "libcamera":
         unique_ptr[CameraConfiguration] generateConfiguration(const vector[StreamRole] &roles);
         int configure(CameraConfiguration *config);
         const ControlList &properties() const;
-        unique_ptr[Request] createRequest(uint64_t cookie = 0);
+        unique_ptr[Request] createRequest(uint64_t cookie);
         int queueRequest(Request *request);
         Signal[Request] requestCompleted;
 
@@ -362,6 +362,8 @@ cdef class PyCameraManager:
 
 from libc.stdio cimport printf, fflush, stdout, stderr, fprintf
 
+cdef char* ipc_address = "ipc://.frame_notif"
+
 
 # cdef object pycbfunc
 @cython.ccall
@@ -372,16 +374,17 @@ cdef void cpp_cb(Request* request):
     cdef void* skt = zmq_socket(ctx, 8) #ZMQ_PUSH=8
 
     cdef int err;
-    err = zmq_connect(skt, "ipc://.frame_notif")
+    err = zmq_connect(skt, ipc_address)
     if err:
         fprintf( stderr, "Failed to connect to ZMQ socket");
         return
     
     # This is a nasty way to get a pointer type in cython
-    cdef int s[1];
+    cdef int s[2];
     s[0] = request.sequence();
-    
-    err = zmq_send(skt, s, 4, 0)
+    s[1] = request.cookie()
+
+    err = zmq_send(skt, s, 8, 0)
     if err:
         fprintf(stderr, "Failed to send message...")
     
@@ -473,6 +476,8 @@ cdef class PyCamera:
             # Create the buffer for the request
             self.buffers.push_back(self.allocator.buffers(self.stream_cfg.stream()).at(buff_num).get())
             b = self.buffers.back()
+            b.setCookie(buff_num)
+            assert b.cookie() == buff_num
 
             # Extract its memory maps
             n_planes = b.planes().size()
@@ -492,7 +497,7 @@ cdef class PyCamera:
                         offset=plane_off)
 
             # Create the request for the buffer and load it in.
-            self.requests.push_back(self._camera.get().createRequest())
+            self.requests.push_back(self._camera.get().createRequest(buff_num))
             self.requests.back().get().addBuffer(self.stream_cfg.stream(), self.buffers.back())
 
         self.dump_mmaps()
@@ -509,8 +514,10 @@ cdef class PyCamera:
 
         logging.info("Starting CallbackManager")
 
+
         cbm = CallbackManager()
-        cbm.start_callback_thread()
+        cbm.add_callback(lambda data: self._log.info("Got callback, contents: %s", repr(data)))
+        cbm.start_callback_thread()      
 
         logging.info("Setup callback")
         self._camera.get().requestCompleted.connect(cpp_cb)    
@@ -532,8 +539,8 @@ cdef class PyCamera:
 
         #     self.images.append(np.frombuffer(mp).copy())
 
-        cbm.stop_callback_thread()
         self._camera.get().stop()
+        cbm.stop_callback_thread()
         self._log.info("Stopped camera")
 
     def close(self):
