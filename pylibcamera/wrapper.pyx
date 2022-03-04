@@ -1,10 +1,12 @@
 import mmap
 import time
 import hashlib
-
 import logging
+import threading
+
 import numpy as np
 
+import zmq
 import cython
 from cython import NULL, size_t
 
@@ -22,6 +24,25 @@ from posix.unistd cimport close, read, off_t
 
 cdef extern from "sys/types.h":
     ctypedef dev_t;
+
+cdef extern from "zmq.h":
+    void *zmq_ctx_new ();
+    int zmq_ctx_term (void *context_);
+    int zmq_ctx_shutdown (void *context_);
+    int zmq_ctx_set (void *context_, int option_, int optval_);
+    int zmq_ctx_get (void *context_, int option_);
+    void *zmq_socket (void *, int type_);
+    int zmq_close (void *s_);
+    int zmq_setsockopt (void *s_, int option_, const void *optval_, size_t optvallen_);
+    int zmq_getsockopt (void *s_, int option_, void *optval_, size_t *optvallen_);
+    int zmq_bind (void *s_, const char *addr_);
+    int zmq_connect (void *s_, const char *addr_);
+    int zmq_unbind (void *s_, const char *addr_);
+    int zmq_disconnect (void *s_, const char *addr_);
+    int zmq_send (void *s_, const void *buf_, size_t len_, int flags_);
+    int zmq_send_const (void *s_, const void *buf_, size_t len_, int flags_);
+    int zmq_recv (void *s_, void *buf_, size_t len_, int flags_);
+    int zmq_socket_monitor (void *s_, const char *addr_, int events_);
 
 cdef extern from "libcamera/libcamera.h" namespace "libcamera":
     ctypedef enum ControlType:
@@ -150,8 +171,8 @@ cdef extern from "libcamera/libcamera.h" namespace "libcamera":
         ReuseBuffers "libcamera::Request::ReuseBuffers"
 
     cdef cppclass Request:
-        uint32_t sequence();
-        uint64_t cookie();
+        uint32_t sequence() const;
+        uint64_t cookie() const;
         Rq_Status status();
         void reuse(ReuseFlag flags);
         ControlList &controls()
@@ -339,14 +360,45 @@ cdef class PyCameraManager:
     def __dealloc__(self):
         self.close()
 
-from libc.stdio cimport printf
+from libc.stdio cimport printf, fflush, stdout, stderr, fprintf
 
 
+# cdef object pycbfunc
 @cython.ccall
 @cython.returns(cython.void)
+@cython.nogil
 cdef void cpp_cb(Request* request):
-    printf("Callback, seq#%i\n", request.sequence())
+    cdef void* ctx = zmq_ctx_new();
+    cdef void* skt = zmq_socket(ctx, 8) #ZMQ_PUSH=8
 
+    cdef int err;
+    err = zmq_connect(skt, "ipc://.frame_notif")
+    if err:
+        fprintf( stderr, "Failed to connect to ZMQ socket");
+        return
+    
+    # This is a nasty way to get a pointer type in cython
+    cdef int s[1];
+    s[0] = request.sequence();
+    
+    err = zmq_send(skt, s, 4, 0)
+    if err:
+        fprintf(stderr, "Failed to send message...")
+    
+    # Will linger until messages are sent
+    err = zmq_close(skt)
+    if err:
+        fprintf(stderr, "Error in socket close?")
+
+    zmq_ctx_term(ctx)
+
+
+def pySetCbFunc(f):
+    pass
+    # global pycbfunc
+    # pycbfunc = f
+
+from pylibcamera.callback import CallbackManager
 
 cdef class PyCamera:
     cdef shared_ptr[Camera] _camera;
@@ -449,12 +501,17 @@ cdef class PyCamera:
         self._log.info("Created memory maps:")
         for fd, mp in self.mmaps.items():
             h = hashlib.sha256(mp)
-            self._log.info(f"FD:{fd} = {mp} hash: {h.hexdigest()}")
+            self._log.info(f"MMAP({id(mp)} FD:{fd} hash: {h.hexdigest()}")
 
     def run_cycle(self):
         logging.info("Starting camera")
         self._camera.get().start(NULL)
-        
+
+        logging.info("Starting CallbackManager")
+
+        cbm = CallbackManager()
+        cbm.start_callback_thread()
+
         logging.info("Setup callback")
         self._camera.get().requestCompleted.connect(cpp_cb)    
 
@@ -466,6 +523,7 @@ cdef class PyCamera:
             if any(self.requests.at(r).get().status() == RequestComplete for r in range(self.requests.size())):
                 break
             time.sleep(0.1)
+            print(i)
 
         # logging.info("Memory maps hashes:")
         # for fd, mp in self.mmaps.items():
@@ -474,6 +532,7 @@ cdef class PyCamera:
 
         #     self.images.append(np.frombuffer(mp).copy())
 
+        cbm.stop_callback_thread()
         self._camera.get().stop()
         self._log.info("Stopped camera")
 

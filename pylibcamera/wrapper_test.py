@@ -2,7 +2,6 @@ import unittest
 
 import pylibcamera.wrapper
 
-
 class TestLibCameraWrapper(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
