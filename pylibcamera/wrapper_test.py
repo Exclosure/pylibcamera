@@ -31,7 +31,7 @@ class TestLibCameraWrapper(unittest.TestCase):
         c = self._cam_manager.get_camera(0)
 
         # Test close is idempotent
-        for i in range(3):
+        for _ in range(3):
             c.close()
 
     def test_everything(self):
@@ -40,7 +40,7 @@ class TestLibCameraWrapper(unittest.TestCase):
         camera = self._cam_manager.get_camera(0)
 
         camera.configure()  
-        camera.dump_controls()
+        # camera.dump_controls()
         camera.create_buffers_and_requests()
         camera.run_cycle()
         camera.close()

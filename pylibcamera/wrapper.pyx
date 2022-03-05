@@ -3,6 +3,7 @@ import time
 import hashlib
 import logging
 import threading
+import struct
 
 import numpy as np
 
@@ -22,27 +23,48 @@ from libcpp.vector cimport vector
 from posix.unistd cimport close, read, off_t
 
 
+cdef extern from "unistd.h":
+    int usleep(unsigned)
+
+
 cdef extern from "sys/types.h":
     ctypedef dev_t;
 
 cdef extern from "zmq.h":
     void *zmq_ctx_new ();
-    int zmq_ctx_term (void *context_);
+    int zmq_ctx_term(void *context_);
     int zmq_ctx_shutdown (void *context_);
-    int zmq_ctx_set (void *context_, int option_, int optval_);
-    int zmq_ctx_get (void *context_, int option_);
+    int zmq_ctx_set(void *context_, int option_, int optval_);
+    int zmq_ctx_get(void *context_, int option_);
     void *zmq_socket (void *, int type_);
-    int zmq_close (void *s_);
+    int zmq_close(void *s_);
     int zmq_setsockopt (void *s_, int option_, const void *optval_, size_t optvallen_);
     int zmq_getsockopt (void *s_, int option_, void *optval_, size_t *optvallen_);
-    int zmq_bind (void *s_, const char *addr_);
-    int zmq_connect (void *s_, const char *addr_);
-    int zmq_unbind (void *s_, const char *addr_);
+    int zmq_bind(void *s_, const char *addr_);
+    int zmq_connect(void *s_, const char *addr_);
+    int zmq_unbind(void *s_, const char *addr_);
     int zmq_disconnect (void *s_, const char *addr_);
-    int zmq_send (void *s_, const void *buf_, size_t len_, int flags_);
+    int zmq_send(void *s_, const void *buf_, size_t len_, int flags_);
     int zmq_send_const (void *s_, const void *buf_, size_t len_, int flags_);
-    int zmq_recv (void *s_, void *buf_, size_t len_, int flags_);
+    int zmq_recv(void *s_, void *buf_, size_t len_, int flags_);
     int zmq_socket_monitor (void *s_, const char *addr_, int events_);
+
+    int ZMQ_VERSION_MAJOR 
+    int ZMQ_VERSION_MINOR
+    int ZMQ_VERSION_PATCH
+
+    int ZMQ_PAIR
+    int ZMQ_PUB
+    int ZMQ_SUB
+    int ZMQ_REQ
+    int ZMQ_REP
+    int ZMQ_DEALER
+    int ZMQ_ROUTER
+    int ZMQ_PULL
+    int ZMQ_PUSH
+    int ZMQ_XPUB
+    int ZMQ_XSUB 
+    int ZMQ_STREAM 
 
 cdef extern from "libcamera/libcamera.h" namespace "libcamera":
     ctypedef enum ControlType:
@@ -360,6 +382,7 @@ cdef class PyCameraManager:
     def __dealloc__(self):
         self.close()
 
+from libc.stdlib cimport rand
 from libc.stdio cimport printf, fflush, stdout, stderr, fprintf
 
 cdef char* ipc_address = "ipc://.frame_notif"
@@ -370,49 +393,79 @@ cdef char* ipc_address = "ipc://.frame_notif"
 @cython.returns(cython.void)
 @cython.nogil
 cdef void cpp_cb(Request* request):
-    cdef void* ctx = zmq_ctx_new();
-    cdef void* skt = zmq_socket(ctx, 8) #ZMQ_PUSH=8
+    """
+    This method is a shim between the C++ world and Python.
+    It uses zmq to send an IPC message to another process.
+    This indirection is needed as the libcamera callback
+    is triggered inside a thread without the ability to
+    access the GIL apropriately. Attempts to access the
+    GIL or python objects results in very
+    confusing SegFault/SIGABRT calls boiling up at nearly
+    random times in the call stack.
 
-    cdef int err;
-    err = zmq_connect(skt, ipc_address)
+    This function is pure C, and serialized a message that
+    contains a pair of ints, which are the frame sequence
+    number and the cookie respectively.
+
+    These can be used on the python side to capture which
+    frame buffer has been populted as a result of requests
+    that have been completed.
+    """
+
+    # usleep(rand() % 300)
+
+    if request.status() == RequestCancelled:
+        fprintf( stderr, "Cancelled Request sequence #%i)\n", request.sequence());
+        return
+
+    cdef void* ctx = zmq_ctx_new()
+    cdef void* skt = zmq_socket(ctx, ZMQ_REQ)
+
+    cdef int err
+    err = zmq_connect(skt, "ipc://.frame_notif")
     if err:
-        fprintf( stderr, "Failed to connect to ZMQ socket");
+        fprintf( stderr, "Failed to connect to ZMQ socket (%i)\n", err);
         return
     
-    # This is a nasty way to get a pointer type in cython
-    cdef int s[2];
-    s[0] = request.sequence();
+    cdef int zero = 0
+    cdef int nbytes = 8;
+    cdef int s[2]
+    s[0] = request.sequence()
     s[1] = request.cookie()
 
-    err = zmq_send(skt, s, 8, 0)
-    if err:
-        fprintf(stderr, "Failed to send message...")
-    
-    # Will linger until messages are sent
+    # zmq_send returns the # of bytes sent..
+    err = zmq_send(skt, s, nbytes, zero)
+    if err != nbytes:
+        fprintf(stderr, "Failed to send message (%i)\n", err)
+
+    cdef char[2] ok;
+    err = zmq_recv(skt, ok, 2, 0)
+    if err != 2:
+        fprintf(stderr, "Did not recv() bytes?")
+
+    # # Will linger until messages are sent
     err = zmq_close(skt)
-    if err:
-        fprintf(stderr, "Error in socket close?")
+    if err != zero:
+        fprintf(stderr, "Error in socket close (%i)\n", err)
 
-    zmq_ctx_term(ctx)
+    err = zmq_ctx_shutdown(ctx)
+    if err != zero:
+        fprintf(stderr, "Error in ctx term (%i)\n", err)
 
-
-def pySetCbFunc(f):
-    pass
-    # global pycbfunc
-    # pycbfunc = f
 
 from pylibcamera.callback import CallbackManager
 
 cdef class PyCamera:
-    cdef shared_ptr[Camera] _camera;
-    cdef unique_ptr[CameraConfiguration] _camera_cfg;
-    cdef StreamConfiguration stream_cfg;
-    cdef FrameBufferAllocator* allocator;
-    cdef vector[FrameBuffer*]* buffers;
-    cdef vector[unique_ptr[Request]]* requests;
+    cdef shared_ptr[Camera] _camera
+    cdef unique_ptr[CameraConfiguration] _camera_cfg
+    cdef StreamConfiguration stream_cfg
+    cdef FrameBufferAllocator* allocator
+    cdef vector[FrameBuffer*]* buffers
+    cdef vector[unique_ptr[Request]]* requests
 
-    mmaps = {};
-    images = [];
+    mmaps = []
+    mmaps_by_fd = {}
+    images = []
 
     _log = logging.getLogger(__name__)
 
@@ -463,9 +516,8 @@ cdef class PyCamera:
         assert self.allocator == NULL
         self.allocator = new FrameBufferAllocator(self._camera)
 
-        self._log.info("Allocating buffers")
         # Allocate buffers for the camera/stream pair
-        
+        self._log.info("Allocating buffers")
         assert self.allocator.allocate(self.stream_cfg.stream()) >= 0, "Buffers did not allocate?"
         assert self.allocator.allocated(), "Buffers did not allocate?"
 
@@ -487,14 +539,16 @@ cdef class PyCamera:
                 plane_len = b.planes().at(plane_num).length
                 self._log.info(f"Buffer #{buff_num} Plane #{plane_num} FD: {plane_fd} Offset: {plane_off} Len: {plane_len}")
 
-                if plane_fd not in self.mmaps:
-                    self.mmaps[plane_fd] = mmap.mmap(
+                if plane_fd not in self.mmaps_by_fd:
+                    mp = mmap.mmap(
                         plane_fd,
                         plane_len,
                         flags=mmap.MAP_SHARED,
                         prot=mmap.PROT_WRITE|mmap.PROT_READ,
                         access=mmap.ACCESS_DEFAULT,
                         offset=plane_off)
+                    self.mmaps.append(mp)
+                    self.mmaps_by_fd[plane_fd] = mp
 
             # Create the request for the buffer and load it in.
             self.requests.push_back(self._camera.get().createRequest(buff_num))
@@ -504,19 +558,41 @@ cdef class PyCamera:
 
     def dump_mmaps(self):
         self._log.info("Created memory maps:")
-        for fd, mp in self.mmaps.items():
+        for fd, mp in self.mmaps_by_fd.items():
             h = hashlib.sha256(mp)
             self._log.info(f"MMAP({id(mp)} FD:{fd} hash: {h.hexdigest()}")
 
+    def wrap_on_frame_callback(self, call: callable):
+        def fb_call_and_recycle(raw_data):
+            sequence, index = struct.unpack("II", raw_data)
+            self._log.debug("Triggering frame CB")
+            cdef Request* req = self.requests.at(index).get()
+            req_status = req.status()
+            if req_status != RequestComplete:
+                # These should be screened out in the cpp call...
+                self._log.warning("Request status not complete: %i", req_status)
+            else:
+                call(sequence, self.mmaps[index])
+                self._log.debug("Frame CB complete")
+            req.reuse(ReuseBuffers)
+            self._camera.get().queueRequest(req)
+
+        return fb_call_and_recycle
+
+    def log_zmq_version(self):
+        self._log.info(f"C ZMQ Version {ZMQ_VERSION_MAJOR}.{ZMQ_VERSION_MINOR}.{ZMQ_VERSION_PATCH}")
+
+
     def run_cycle(self):
+        self.log_zmq_version()
         logging.info("Starting camera")
         self._camera.get().start(NULL)
 
         logging.info("Starting CallbackManager")
-
-
         cbm = CallbackManager()
-        cbm.add_callback(lambda data: self._log.info("Got callback, contents: %s", repr(data)))
+
+        wrapped_cb = self.wrap_on_frame_callback(lambda *args: self._log.info("Callback with %s", repr(args)))
+        cbm.add_callback(wrapped_cb)
         cbm.start_callback_thread()      
 
         logging.info("Setup callback")
@@ -526,14 +602,19 @@ cdef class PyCamera:
             logging.info(f"Queueing request {i}")
             self._camera.get().queueRequest(self.requests.at(i).get())
 
-        for i in range(20):
-            if any(self.requests.at(r).get().status() == RequestComplete for r in range(self.requests.size())):
-                break
-            time.sleep(0.1)
-            print(i)
-
+        if False:
+            for i in range(20):
+                self._log.debug("Polling requests")
+                for r in range(self.requests.size()):
+                    status = self.requests.at(r).get().status()
+                    self._log.debug("Request %i, status: %i", r, status)
+                
+                time.sleep(0.1)
+        else:
+            time.sleep(5)
+        
         # logging.info("Memory maps hashes:")
-        # for fd, mp in self.mmaps.items():
+        # for fd, mp in self.mmaps_by_fd.items():
         #     h = hashlib.sha256(mp)
         #     logging.info(f"FD:{fd} = {mp} hash: {h.hexdigest()}")
 
