@@ -131,6 +131,9 @@ cdef extern from "libcamera/libcamera.h" namespace "libcamera":
     cdef cppclass ControlListMap(unordered_map[unsigned int, ControlValue]):
         pass
 
+    cdef cppclass ControlIdMap(unordered_map[unsigned int, const ControlId *]):
+        pass
+
     cdef cppclass ControlList:
         ControlList()
         # void set(unsigned int id, const ControlValue &value);
@@ -139,9 +142,19 @@ cdef extern from "libcamera/libcamera.h" namespace "libcamera":
         size_t size();
         const ControlValue &get(unsigned int id);
         const ControlInfoMap* infoMap();
-        # cppclass iterator:
-        #     Control& operator*()
-        #     iterator operator++()
+
+        # const_iterator begin() const
+        # const_iterator end() const
+
+        cppclass iterator:
+            pair[unsigned int, ControlValue] operator*()
+            iterator operator++()
+            bint operator!=(iterator)
+
+        iterator begin()
+        iterator end()
+
+        const ControlIdMap* idMap()
 
     cdef cppclass ControlInfo:
         ControlInfo(ControlValue &min, ControlValue &max, ControlValue &default);
@@ -149,8 +162,8 @@ cdef extern from "libcamera/libcamera.h" namespace "libcamera":
         # ControlInfo(std::set<bool> values, bool def);
         ControlInfo(bool value);
 
-        ControlValue &min();
-        ControlValue &max();
+        const ControlValue &min();
+        const ControlValue &max();
         # ControlValue &def(); # Really unsure how to wrap this one...
         vector[ControlValue] &values();
 
@@ -443,6 +456,9 @@ cdef void cpp_cb(Request* request):
     if err != 2:
         fprintf(stderr, "Did not recv() bytes?")
 
+    # if ok[0] != "O" or ok[1] != "K":
+    #     fprintf(stderr, "Unexpected response %s\n", ok)
+
     # # Will linger until messages are sent
     err = zmq_close(skt)
     if err != zero:
@@ -502,7 +518,25 @@ cdef class PyCamera:
     def dump_controls(self):
         assert self._camera != NULL
         
-        # m = self._camera.get().properties().infoMap()
+        cdef ControlList cl = self._camera.get().properties()
+        cdef const ControlIdMap* cid_map = cl.idMap()
+        cdef int zero = 0
+        ctl_iter = cl.begin()
+       
+        for i in range(cl.size()):
+            pair = cython.operator.dereference(ctl_iter) 
+            control_id = pair.first
+            print(f"{pair.first}, - {cid_map.at(pair.first).name()}={pair.second.toString()}")
+            cython.operator.postincrement(ctl_iter)
+
+        # id_iter = cid_map.begin()
+        # for i in range(cid_map.size()):
+        #     pass
+
+
+        # self._camera.get().properties()
+            # print(c.name())
+        # m = .infoMap()
         # for v in m.begin():
         #     cython.cast(cython.uint, v.first)
 
@@ -611,7 +645,7 @@ cdef class PyCamera:
                 
                 time.sleep(0.1)
         else:
-            time.sleep(5)
+            time.sleep(1)
         
         # logging.info("Memory maps hashes:")
         # for fd, mp in self.mmaps_by_fd.items():

@@ -34,13 +34,22 @@ class TestLibCameraWrapper(unittest.TestCase):
         for _ in range(3):
             c.close()
 
+    def test_get_controls(self):
+        self._skip_if_no_camera()
+
+        camera = self._cam_manager.get_camera(0)
+
+        camera.configure()  
+        camera.dump_controls()
+        camera.close()
+
     def test_everything(self):
         self._skip_if_no_camera()
 
         camera = self._cam_manager.get_camera(0)
 
         camera.configure()  
-        # camera.dump_controls()
+        camera.dump_controls()
         camera.create_buffers_and_requests()
         camera.run_cycle()
         camera.close()
