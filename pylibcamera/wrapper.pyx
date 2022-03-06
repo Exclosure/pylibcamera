@@ -617,6 +617,12 @@ cdef class PyCamera:
             h = hashlib.sha256(mp)
             self._log.info(f"MMAP({id(mp)} FD:{fd} hash: {h.hexdigest()}")
 
+    cdef _queue_request(self, Request* request):
+        assert _camera != NULL
+        err = self._camera.get().queueRequest(request)
+        if err != 0:
+            self._log.warning("Nonzero return on queueRequest(): %i", err)
+
     def wrap_on_frame_callback(self, call: callable):
         def fb_call_and_recycle(raw_data):
             sequence, index = struct.unpack("II", raw_data)
@@ -630,11 +636,7 @@ cdef class PyCamera:
             self._log.debug("Triggering frame CB")
             call(sequence, self.mmaps[index])
             self._log.debug("Frame CB complete")
-            req.reuse(ReuseBuffers)
-
-            err = self._camera.get().queueRequest(req)
-            if err != 0:
-                self._log.warning("Nonzero return on queueRequest(): %i", err)
+            _queue_request(req)
 
         return fb_call_and_recycle
 
@@ -658,9 +660,8 @@ cdef class PyCamera:
 
         for i in range(self.requests.size()):
             self._log.info(f"Queueing request {i}")
-            err = self._camera.get().queueRequest(self.requests.at(i).get())
-            if err != 0:
-                self._log.warning("Nonzero return from queueRequest(): %i", err)
+            req.reuse(ReuseBuffers)
+            self._queue_request(req)
 
         if False:
             for i in range(20):
