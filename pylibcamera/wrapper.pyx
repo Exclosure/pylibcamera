@@ -11,7 +11,7 @@ import zmq
 import cython
 from cython import NULL, size_t
 
-from libc.stdint cimport uint32_t, uint64_t
+from libc.stdint cimport uint8_t, uint32_t, uint64_t
 
 from libcpp cimport bool
 from libcpp.memory cimport unique_ptr, shared_ptr
@@ -116,6 +116,10 @@ cdef extern from "libcamera/libcamera.h" namespace "libcamera":
         unsigned int id();
         const string &name();
 
+    cdef cppclass Span[T]:
+        size_t size();
+        T* data() const;
+
     cdef cppclass ControlValue:
         ControlValue()
         ControlValue(const ControlValue &other);
@@ -125,10 +129,13 @@ cdef extern from "libcamera/libcamera.h" namespace "libcamera":
         bool isNone();
         bool isArray();
         size_t numElements();
-        # Span<const uint8_t> data();
+        Span[const uint8_t] data();
         string toString() const;
 
     cdef cppclass ControlListMap(unordered_map[unsigned int, ControlValue]):
+        pass
+
+    cdef cppclass ControlIdMap(unordered_map[unsigned int, const ControlId *]):
         pass
 
     cdef cppclass ControlList:
@@ -139,9 +146,19 @@ cdef extern from "libcamera/libcamera.h" namespace "libcamera":
         size_t size();
         const ControlValue &get(unsigned int id);
         const ControlInfoMap* infoMap();
-        # cppclass iterator:
-        #     Control& operator*()
-        #     iterator operator++()
+
+        # const_iterator begin() const
+        # const_iterator end() const
+
+        cppclass iterator:
+            pair[unsigned int, ControlValue] operator*()
+            iterator operator++()
+            bint operator!=(iterator)
+
+        iterator begin()
+        iterator end()
+
+        const ControlIdMap* idMap()
 
     cdef cppclass ControlInfo:
         ControlInfo(ControlValue &min, ControlValue &max, ControlValue &default);
@@ -149,8 +166,8 @@ cdef extern from "libcamera/libcamera.h" namespace "libcamera":
         # ControlInfo(std::set<bool> values, bool def);
         ControlInfo(bool value);
 
-        ControlValue &min();
-        ControlValue &max();
+        const ControlValue &min();
+        const ControlValue &max();
         # ControlValue &def(); # Really unsure how to wrap this one...
         vector[ControlValue] &values();
 
@@ -443,6 +460,9 @@ cdef void cpp_cb(Request* request):
     if err != 2:
         fprintf(stderr, "Did not recv() bytes?")
 
+    # if ok[0] != "O" or ok[1] != "K":
+    #     fprintf(stderr, "Unexpected response %s\n", ok)
+
     # # Will linger until messages are sent
     err = zmq_close(skt)
     if err != zero:
@@ -453,6 +473,8 @@ cdef void cpp_cb(Request* request):
         fprintf(stderr, "Error in ctx term (%i)\n", err)
 
 
+# Harvest upward
+from libcpp.cast cimport reinterpret_cast
 from pylibcamera.callback import CallbackManager
 
 cdef class PyCamera:
@@ -500,17 +522,53 @@ cdef class PyCamera:
         self.stream_cfg = self._camera_cfg.get().at(0)
     
     def dump_controls(self):
-        assert self._camera != NULL
-        
-        # m = self._camera.get().properties().infoMap()
-        # for v in m.begin():
-        #     cython.cast(cython.uint, v.first)
+        assert self._camera != NULL      
+        cdef ControlList cl = self._camera.get().properties()
+        print(self._decode_control_list(cl))
 
-        # for k, v in [0]:
-        #     print(k, v)
-        # n_controls = cl.size()
-        # for n in range(n_controls):
-        #     self._log.info(cl.get(n).toString())
+    
+
+
+    cdef _decode_control_list(self, ControlList cl):
+        cdef const ControlIdMap* cid_map = cl.idMap()
+        r = {}
+        ctl_iter = cl.begin()
+        for i in range(cl.size()):
+            pair = cython.operator.dereference(ctl_iter) 
+            name = cid_map.at(pair.first).name().decode()
+            r[name] = self._control_decoder(pair.second)
+            cython.operator.postincrement(ctl_iter)
+        return r
+
+    cdef _control_decoder(self, ControlValue c):
+        cdef const uint8_t *data = c.data().data()
+
+        if c.type() == ControlTypeBool:
+            return struct.unpack("c", data) != 0
+        elif c.type() == ControlTypeByte:
+            return struct.unpack("c", data)[0]
+        elif c.type() == ControlTypeInteger32:
+            return struct.unpack("i", data)
+        elif c.type() == ControlTypeInteger64:
+            return struct.unpack("q", data)
+        elif c.type() == ControlTypeFloat:
+            return struct.unpack("f", data)
+        elif c.type() == ControlTypeRectangle:
+            # NOTE(meawoppl) - Nasty nasty hack hack hack
+            raw = c.toString().decode()
+            raw = raw.replace("/","x")
+            for r in "()[] ":
+                raw = raw.replace(r, "")
+            return tuple(int(s) for s in raw.split("x"))
+        elif c.type() == ControlTypeSize:
+            # NOTE(meawoppl) - Nasty nasty hack hack hack
+            return tuple(int(s) for s in c.toString().decode().split("x"))
+        elif c.type() == ControlTypeNone:
+            return None
+        elif c.type() == ControlTypeString:
+            return c.toString().decode()
+        
+        assert False
 
     def create_buffers_and_requests(self):
         assert self.allocator == NULL
@@ -582,7 +640,6 @@ cdef class PyCamera:
     def log_zmq_version(self):
         self._log.info(f"C ZMQ Version {ZMQ_VERSION_MAJOR}.{ZMQ_VERSION_MINOR}.{ZMQ_VERSION_PATCH}")
 
-
     def run_cycle(self):
         self.log_zmq_version()
         logging.info("Starting camera")
@@ -611,7 +668,7 @@ cdef class PyCamera:
                 
                 time.sleep(0.1)
         else:
-            time.sleep(5)
+            time.sleep(1)
         
         # logging.info("Memory maps hashes:")
         # for fd, mp in self.mmaps_by_fd.items():
