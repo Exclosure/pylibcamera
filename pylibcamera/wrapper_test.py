@@ -40,7 +40,11 @@ class TestLibCameraWrapper(unittest.TestCase):
         camera = self._cam_manager.get_camera(0)
 
         camera.configure()  
-        camera.dump_controls()
+        controls = camera.get_controls()
+
+        assert isinstance(controls, dict)
+        assert len(controls) >= 3
+
         camera.close()
 
     def test_everything(self):
@@ -49,7 +53,6 @@ class TestLibCameraWrapper(unittest.TestCase):
         camera = self._cam_manager.get_camera(0)
 
         camera.configure()  
-        camera.dump_controls()
         camera.create_buffers_and_requests()
         camera.run_cycle()
         camera.close()
