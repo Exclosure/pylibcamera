@@ -18,6 +18,7 @@ class CallbackManager:
         self._thread = None
         
         self._callbacks = []
+        self._call_onces = []
         self._bound = threading.Event()
         self._shutdown = threading.Event()
         self._log.info("PyZmq version" + ".".join(str(i) for i in zmq.backend.zmq_version_info()))
@@ -33,6 +34,9 @@ class CallbackManager:
             pass
     
     def _run_callbacks(self, payload: bytes):
+        while len(self._call_onces) > 0:
+            self._call_onces.pop()(payload)
+
         for callback in self._callbacks:
             try:
                 callback(payload)
@@ -62,6 +66,8 @@ class CallbackManager:
 
     def add_callback(self, cb: callable):
         self._callbacks.append(cb)
+
+
 
     def start_callback_thread(self):
         """Start the thread that watches for callbacks"""

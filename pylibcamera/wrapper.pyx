@@ -618,7 +618,8 @@ cdef class PyCamera:
             self._log.info(f"MMAP({id(mp)} FD:{fd} hash: {h.hexdigest()}")
 
     cdef _queue_request(self, Request* request):
-        assert _camera != NULL
+        assert self._camera != NULL
+        request.reuse(ReuseBuffers)
         err = self._camera.get().queueRequest(request)
         if err != 0:
             self._log.warning("Nonzero return on queueRequest(): %i", err)
@@ -636,7 +637,7 @@ cdef class PyCamera:
             self._log.debug("Triggering frame CB")
             call(sequence, self.mmaps[index])
             self._log.debug("Frame CB complete")
-            _queue_request(req)
+            self._queue_request(req)
 
         return fb_call_and_recycle
 
@@ -660,8 +661,8 @@ cdef class PyCamera:
 
         for i in range(self.requests.size()):
             self._log.info(f"Queueing request {i}")
-            req.reuse(ReuseBuffers)
-            self._queue_request(req)
+            r = self.requests.at(i).get()
+            self._queue_request(r)
 
         if False:
             for i in range(20):

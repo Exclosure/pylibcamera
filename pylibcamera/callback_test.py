@@ -36,9 +36,10 @@ class TestEventWidgit(unittest.TestCase):
             payload = b'????'
             with zmq.Context() as ctx:
                 with zmq.Socket(ctx, zmq.REQ) as skt:
-                    skt.connect("ipc://.frame_notif")
-                    skt.send(payload)
-                    assert skt.recv() == b"OK"
+                    for _ in range(3):
+                        skt.connect("ipc://.frame_notif")
+                        skt.send(payload)
+                        assert skt.recv() == b"OK"
 
             time.sleep(0.1)
             mm.assert_called_with(payload)
