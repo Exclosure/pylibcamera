@@ -1,5 +1,7 @@
 import unittest
 
+import pytest
+
 import pylibcamera.wrapper
 
 class TestLibCameraWrapper(unittest.TestCase):
@@ -38,7 +40,7 @@ class TestLibCameraWrapper(unittest.TestCase):
         self._skip_if_no_camera()
 
         camera = self._cam_manager.get_camera(0)
-
+        
         camera.configure()  
         controls = camera.get_controls()
 

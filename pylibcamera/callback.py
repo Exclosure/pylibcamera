@@ -33,16 +33,23 @@ class CallbackManager:
         except FileNotFoundError:
             pass
     
+    def _try_except_log(self, call, *args, **kwargs):
+        try:
+            call(*args, **kwargs)
+            return True
+        except Exception as e:
+            self._log.exception("Callback triggered an exception", exc_info=e)
+        return False
+
     def _run_callbacks(self, payload: bytes):
+        n_called = 0
         while len(self._call_onces) > 0:
-            self._call_onces.pop()(payload)
+            n_called += self._try_except_log(self._call_onces.pop(), payload)
 
         for callback in self._callbacks:
-            try:
-                callback(payload)
-            except Exception as e:
-                self._log.exception("Callback triggered an exception", exc_info=e)
-        self._log.debug("Delivered %i callbacks", len(self._callbacks))
+            n_called += self._try_except_log(callback, payload)
+            
+        self._log.debug("Delivered %i callbacks", n_called)
 
     def _thread_run(self, shutdown: threading.Event, bound: threading.Event):
         self._log.debug("Thread started")
@@ -59,15 +66,17 @@ class CallbackManager:
                     self._log.debug("Received %i bytes", len(payload))
                     self._run_callbacks(payload)
                     skt.send(b"OK")
+                    self._log.debug("Sent OK")
                 skt.close(250)
                 self._log.debug("Exiting Socket Context")
             self._rm_socket()
         self._log.debug("Exiting Thread")
 
-    def add_callback(self, cb: callable):
+    def add_callback(self, cb: callable) -> None:
         self._callbacks.append(cb)
 
-
+    def add_call_once(self, cb: callable) -> None:
+        self._call_onces.append(cb)
 
     def start_callback_thread(self):
         """Start the thread that watches for callbacks"""
