@@ -2,6 +2,7 @@ import mmap
 import time
 import hashlib
 import logging
+import pprint
 import threading
 import struct
 
@@ -11,7 +12,7 @@ import zmq
 import cython
 from cython import NULL, size_t
 
-from libc.stdint cimport uint32_t, uint64_t
+from libc.stdint cimport uint8_t, uint32_t, uint64_t
 
 from libcpp cimport bool
 from libcpp.memory cimport unique_ptr, shared_ptr
@@ -66,6 +67,19 @@ cdef extern from "zmq.h":
     int ZMQ_XSUB 
     int ZMQ_STREAM 
 
+    int ZMQ_POLLIN
+    int ZMQ_POLLOUT
+    int ZMQ_POLLERR
+    int ZMQ_POLLPRI
+
+    cdef struct zmq_pollitem_t:
+        void *socket;
+        int fd;
+        short events;
+        short revents;
+
+    int zmq_poll (zmq_pollitem_t *items_, int nitems_, long timeout_);
+
 cdef extern from "libcamera/libcamera.h" namespace "libcamera":
     ctypedef enum ControlType:
         ControlTypeNone,
@@ -116,6 +130,10 @@ cdef extern from "libcamera/libcamera.h" namespace "libcamera":
         unsigned int id();
         const string &name();
 
+    cdef cppclass Span[T]:
+        size_t size();
+        T* data() const;
+
     cdef cppclass ControlValue:
         ControlValue()
         ControlValue(const ControlValue &other);
@@ -125,10 +143,13 @@ cdef extern from "libcamera/libcamera.h" namespace "libcamera":
         bool isNone();
         bool isArray();
         size_t numElements();
-        # Span<const uint8_t> data();
+        Span[const uint8_t] data();
         string toString() const;
 
     cdef cppclass ControlListMap(unordered_map[unsigned int, ControlValue]):
+        pass
+
+    cdef cppclass ControlIdMap(unordered_map[unsigned int, const ControlId *]):
         pass
 
     cdef cppclass ControlList:
@@ -139,9 +160,19 @@ cdef extern from "libcamera/libcamera.h" namespace "libcamera":
         size_t size();
         const ControlValue &get(unsigned int id);
         const ControlInfoMap* infoMap();
-        # cppclass iterator:
-        #     Control& operator*()
-        #     iterator operator++()
+
+        # const_iterator begin() const
+        # const_iterator end() const
+
+        cppclass iterator:
+            pair[unsigned int, ControlValue] operator*()
+            iterator operator++()
+            bint operator!=(iterator)
+
+        iterator begin()
+        iterator end()
+
+        const ControlIdMap* idMap()
 
     cdef cppclass ControlInfo:
         ControlInfo(ControlValue &min, ControlValue &max, ControlValue &default);
@@ -149,8 +180,8 @@ cdef extern from "libcamera/libcamera.h" namespace "libcamera":
         # ControlInfo(std::set<bool> values, bool def);
         ControlInfo(bool value);
 
-        ControlValue &min();
-        ControlValue &max();
+        const ControlValue &min();
+        const ControlValue &max();
         # ControlValue &def(); # Really unsure how to wrap this one...
         vector[ControlValue] &values();
 
@@ -362,6 +393,14 @@ cdef class PyCameraManager:
         pc._camera = self.cm.cameras()[index]
         return pc 
 
+    def get_camera_matching(self, query: str):
+        names = self.get_camera_names()
+        for i, name in enumerate(names):
+            if query in name:
+                return self.get_camera(i)
+        
+        raise RuntimeError(f"No cameras match '{query}'")
+
     def close(self):
         """
         Close and deallocate camera manager resources.
@@ -412,10 +451,7 @@ cdef void cpp_cb(Request* request):
     that have been completed.
     """
 
-    # usleep(rand() % 300)
-
-    if request.status() == RequestCancelled:
-        fprintf( stderr, "Cancelled Request sequence #%i)\n", request.sequence());
+    if request.status() != RequestComplete:
         return
 
     cdef void* ctx = zmq_ctx_new()
@@ -427,32 +463,53 @@ cdef void cpp_cb(Request* request):
         fprintf( stderr, "Failed to connect to ZMQ socket (%i)\n", err);
         return
     
-    cdef int zero = 0
+    # Poll to see if we can send a message
+    cdef zmq_pollitem_t items[1];
+    items[0].socket = skt;
+    items[0].events = ZMQ_POLLOUT;
+    err = zmq_poll(items, 1, 500);
+    if err != 1:
+        fprintf(stderr, "zmq_poll returned %i\n", err)
+        return
+
     cdef int nbytes = 8;
     cdef int s[2]
     s[0] = request.sequence()
     s[1] = request.cookie()
 
     # zmq_send returns the # of bytes sent..
-    err = zmq_send(skt, s, nbytes, zero)
+    err = zmq_send(skt, s, nbytes, 0)
     if err != nbytes:
         fprintf(stderr, "Failed to send message (%i)\n", err)
+        return
+
+    items[0].socket = skt;
+    items[0].events = ZMQ_POLLIN;
+    err = zmq_poll(items, 1, 10000);
+    if err != 1:
+        fprintf(stderr, "zmq_poll returned %i\n", err)
+        return
 
     cdef char[2] ok;
     err = zmq_recv(skt, ok, 2, 0)
     if err != 2:
         fprintf(stderr, "Did not recv() bytes?")
 
+    # if ok[0] != "O" or ok[1] != "K":
+    #     fprintf(stderr, "Unexpected response %s\n", ok)
+
     # # Will linger until messages are sent
     err = zmq_close(skt)
-    if err != zero:
+    if err != 0:
         fprintf(stderr, "Error in socket close (%i)\n", err)
 
     err = zmq_ctx_shutdown(ctx)
-    if err != zero:
+    if err != 0:
         fprintf(stderr, "Error in ctx term (%i)\n", err)
 
 
+# Harvest upward
+from libcpp.cast cimport reinterpret_cast
 from pylibcamera.callback import CallbackManager
 
 cdef class PyCamera:
@@ -482,7 +539,6 @@ cdef class PyCamera:
         self._camera.get().acquire()
         # Generate a configuration that support raw stills
         # NOTE(meawoppl) - the example I am following uses this, but lib barfs when I add "StillCapture" and "Raw", so IDK
-        # self.config = self.camera.generateConfiguration([StreamRole.StillCapture, StreamRole.Raw])   
         self._camera_cfg = self._camera.get().generateConfiguration([StreamRole.StillCapture])   
         assert self._camera_cfg.get() != NULL
 
@@ -499,18 +555,55 @@ cdef class PyCamera:
         self._log.info("Using stream config #0")
         self.stream_cfg = self._camera_cfg.get().at(0)
     
-    def dump_controls(self):
-        assert self._camera != NULL
-        
-        # m = self._camera.get().properties().infoMap()
-        # for v in m.begin():
-        #     cython.cast(cython.uint, v.first)
+    def get_controls(self):
+        assert self._camera != NULL      
+        cdef ControlList cl = self._camera.get().properties()
+        return self._decode_control_list(cl)
 
-        # for k, v in [0]:
-        #     print(k, v)
-        # n_controls = cl.size()
-        # for n in range(n_controls):
-        #     self._log.info(cl.get(n).toString())
+    cdef _log_control_list(self, ControlList cl):
+        dec = self._decode_control_list(cl)
+        self._log.debug(pprint.pformat(dec))
+
+    cdef _decode_control_list(self, ControlList cl):
+        cdef const ControlIdMap* cid_map = cl.idMap()
+        r = {}
+        ctl_iter = cl.begin()
+        for i in range(cl.size()):
+            pair = cython.operator.dereference(ctl_iter) 
+            name = cid_map.at(pair.first).name().decode()
+            r[name] = self._control_decoder(pair.second)
+            cython.operator.postincrement(ctl_iter)
+        return r
+
+    cdef _control_decoder(self, ControlValue c):
+        cdef const uint8_t *data = c.data().data()
+
+        if c.type() == ControlTypeBool:
+            return struct.unpack("c", data) != 0
+        elif c.type() == ControlTypeByte:
+            return struct.unpack("c", data)[0]
+        elif c.type() == ControlTypeInteger32:
+            return struct.unpack("i", data)
+        elif c.type() == ControlTypeInteger64:
+            return <long long> c.data().data()
+        elif c.type() == ControlTypeFloat:
+            return struct.unpack("f", data)
+        elif c.type() == ControlTypeRectangle:
+            # NOTE(meawoppl) - Nasty nasty hack hack hack
+            raw = c.toString().decode()
+            raw = raw.replace("/","x")
+            for r in "()[] ":
+                raw = raw.replace(r, "")
+            return tuple(int(s) for s in raw.split("x"))
+        elif c.type() == ControlTypeSize:
+            # NOTE(meawoppl) - Nasty nasty hack hack hack
+            return tuple(int(s) for s in c.toString().decode().split("x"))
+        elif c.type() == ControlTypeNone:
+            return None
+        elif c.type() == ControlTypeString:
+            return c.toString().decode()
+        
+        assert False
 
     def create_buffers_and_requests(self):
         assert self.allocator == NULL
@@ -562,66 +655,78 @@ cdef class PyCamera:
             h = hashlib.sha256(mp)
             self._log.info(f"MMAP({id(mp)} FD:{fd} hash: {h.hexdigest()}")
 
+    cdef _queue_request(self, Request* request):
+        assert self._camera != NULL
+        request.reuse(ReuseBuffers)
+        err = self._camera.get().queueRequest(request)
+        if err != 0:
+            self._log.warning("Nonzero return on queueRequest(): %i", err)
+
+    def _queue_all_requests(self):
+        for i in range(self.requests.size()):
+            self._log.info(f"Queueing request {i}")
+            r = self.requests.at(i).get()
+            self._queue_request(r)
+
     def wrap_on_frame_callback(self, call: callable):
         def fb_call_and_recycle(raw_data):
             sequence, index = struct.unpack("II", raw_data)
-            self._log.debug("Triggering frame CB")
             cdef Request* req = self.requests.at(index).get()
             req_status = req.status()
             if req_status != RequestComplete:
                 # These should be screened out in the cpp call...
                 self._log.warning("Request status not complete: %i", req_status)
-            else:
-                call(sequence, self.mmaps[index])
-                self._log.debug("Frame CB complete")
-            req.reuse(ReuseBuffers)
-            self._camera.get().queueRequest(req)
+                return
+            self._log.debug("Frame completed callback delivered")
+            
+            self._log.debug("Controls")
+            self._log_control_list(req.controls())
+            
+            self._log.debug("Metadata")
+            self._log_control_list(req.metadata())
+            
+            self._log.debug("Triggering frame CB")
+            call(sequence, self.mmaps[index])
+
+            self._log.debug("Frame CB complete")
+            self._queue_request(req)
 
         return fb_call_and_recycle
 
-    def log_zmq_version(self):
-        self._log.info(f"C ZMQ Version {ZMQ_VERSION_MAJOR}.{ZMQ_VERSION_MINOR}.{ZMQ_VERSION_PATCH}")
+    def _to_array_cb(self, seq, buff):
+        self.images.append(np.frombuffer(buff, dtype=np.uint8).reshape((1080, 1920, -1)).copy())
 
+    def get_one_frame(self):
+        self._log.info("Setup callback")
+        self._camera.get().requestCompleted.connect(cpp_cb)
+        with CallbackManager() as cbm:
+            wrapped_cb = self.wrap_on_frame_callback(lambda *args: self._log.info("Callback with %s", repr(args)))
+            cbm.add_callback(wrapped_cb)
+            
+            wrapped_cb = self.wrap_on_frame_callback(self._to_array_cb)
+            cbm.add_call_once(wrapped_cb)
+
+            self._log.info("Starting camera")
+            self._camera.get().start(NULL)
+            self._queue_all_requests()
+            time.sleep(0.5)
+            self._camera.get().stop()
+        
+        return self.images[0]
+        
 
     def run_cycle(self):
-        self.log_zmq_version()
-        logging.info("Starting camera")
-        self._camera.get().start(NULL)
+        self._log.info("Setup callback")
+        self._camera.get().requestCompleted.connect(cpp_cb)
+        with CallbackManager() as cbm:
+            wrapped_cb = self.wrap_on_frame_callback(lambda *args: self._log.info("Callback with %s", repr(args)))
+            cbm.add_callback(wrapped_cb)
 
-        logging.info("Starting CallbackManager")
-        cbm = CallbackManager()
-
-        wrapped_cb = self.wrap_on_frame_callback(lambda *args: self._log.info("Callback with %s", repr(args)))
-        cbm.add_callback(wrapped_cb)
-        cbm.start_callback_thread()      
-
-        logging.info("Setup callback")
-        self._camera.get().requestCompleted.connect(cpp_cb)    
-
-        for i in range(self.requests.size()):
-            logging.info(f"Queueing request {i}")
-            self._camera.get().queueRequest(self.requests.at(i).get())
-
-        if False:
-            for i in range(20):
-                self._log.debug("Polling requests")
-                for r in range(self.requests.size()):
-                    status = self.requests.at(r).get().status()
-                    self._log.debug("Request %i, status: %i", r, status)
-                
-                time.sleep(0.1)
-        else:
-            time.sleep(5)
-        
-        # logging.info("Memory maps hashes:")
-        # for fd, mp in self.mmaps_by_fd.items():
-        #     h = hashlib.sha256(mp)
-        #     logging.info(f"FD:{fd} = {mp} hash: {h.hexdigest()}")
-
-        #     self.images.append(np.frombuffer(mp).copy())
-
-        self._camera.get().stop()
-        cbm.stop_callback_thread()
+            self._log.info("Starting camera")
+            self._camera.get().start(NULL)
+            self._queue_all_requests()
+            time.sleep(0.5)
+            self._camera.get().stop()
         self._log.info("Stopped camera")
 
     def close(self):
@@ -632,7 +737,6 @@ cdef class PyCamera:
         if self._camera.get() != NULL:
             self._camera.get().release()
             self._log.info("Released Camera")
-
 
     def __dealloc__(self):
         self.close()
