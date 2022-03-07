@@ -21,7 +21,10 @@ class CallbackManager:
         self._call_onces = []
         self._bound = threading.Event()
         self._shutdown = threading.Event()
-        self._log.info("PyZmq version" + ".".join(str(i) for i in zmq.backend.zmq_version_info()))
+
+        backend_v = ".".join(str(i) for i in zmq.backend.zmq_version_info())
+        pyzmq_v = zmq.__version__
+        self._log.info(f"PyZmq version: {pyzmq_v} Backend: {backend_v}") 
     
     def get_url(self):
         return self._url
@@ -78,8 +81,16 @@ class CallbackManager:
     def add_call_once(self, cb: callable) -> None:
         self._call_onces.append(cb)
 
+    def __enter__(self):
+        self.start_callback_thread()
+        return self
+    
+    def __exit__(self, *args):
+        self.stop_callback_thread()
+
     def start_callback_thread(self):
         """Start the thread that watches for callbacks"""
+        self._log.debug("Callback Manager Starting")
         assert self._thread is None
         self._shutdown.clear()
         self._bound.clear()
@@ -87,13 +98,13 @@ class CallbackManager:
             target=self._thread_run,
             args=(self._shutdown, self._bound)
         )
-        self._thread.setDaemon(True)
+        self._thread.daemon =True
         self._thread.start()
         assert self._bound.wait(timeout=1.0), "Thread did not set bind"
     
     def stop_callback_thread(self):
         """Stop the socket watcher. Raises AssertionError if the thread does not stop."""
-        self._log.debug("Shutdown called")
+        self._log.debug("Callback Manager Stopping")
         if self._thread is None:
             return
         assert self._thread.is_alive(), "Unexpected thread shutdown"

@@ -2,6 +2,7 @@ import mmap
 import time
 import hashlib
 import logging
+import pprint
 import threading
 import struct
 
@@ -65,6 +66,19 @@ cdef extern from "zmq.h":
     int ZMQ_XPUB
     int ZMQ_XSUB 
     int ZMQ_STREAM 
+
+    int ZMQ_POLLIN
+    int ZMQ_POLLOUT
+    int ZMQ_POLLERR
+    int ZMQ_POLLPRI
+
+    cdef struct zmq_pollitem_t:
+        void *socket;
+        int fd;
+        short events;
+        short revents;
+
+    int zmq_poll (zmq_pollitem_t *items_, int nitems_, long timeout_);
 
 cdef extern from "libcamera/libcamera.h" namespace "libcamera":
     ctypedef enum ControlType:
@@ -379,6 +393,14 @@ cdef class PyCameraManager:
         pc._camera = self.cm.cameras()[index]
         return pc 
 
+    def get_camera_matching(self, query: str):
+        names = self.get_camera_names()
+        for i, name in enumerate(names):
+            if query in name:
+                return self.get_camera(i)
+        
+        raise RuntimeError(f"No cameras match '{query}'")
+
     def close(self):
         """
         Close and deallocate camera manager resources.
@@ -432,7 +454,6 @@ cdef void cpp_cb(Request* request):
     if request.status() != RequestComplete:
         return
 
-    fprintf(stderr, "Request Status %i\n", request.status())
     cdef void* ctx = zmq_ctx_new()
     cdef void* skt = zmq_socket(ctx, ZMQ_REQ)
 
@@ -442,6 +463,15 @@ cdef void cpp_cb(Request* request):
         fprintf( stderr, "Failed to connect to ZMQ socket (%i)\n", err);
         return
     
+    # Poll to see if we can send a message
+    cdef zmq_pollitem_t items[1];
+    items[0].socket = skt;
+    items[0].events = ZMQ_POLLOUT;
+    err = zmq_poll(items, 1, 500);
+    if err != 1:
+        fprintf(stderr, "zmq_poll returned %i\n", err)
+        return
+
     cdef int nbytes = 8;
     cdef int s[2]
     s[0] = request.sequence()
@@ -451,13 +481,19 @@ cdef void cpp_cb(Request* request):
     err = zmq_send(skt, s, nbytes, 0)
     if err != nbytes:
         fprintf(stderr, "Failed to send message (%i)\n", err)
+        return
+
+    items[0].socket = skt;
+    items[0].events = ZMQ_POLLIN;
+    err = zmq_poll(items, 1, 10000);
+    if err != 1:
+        fprintf(stderr, "zmq_poll returned %i\n", err)
+        return
 
     cdef char[2] ok;
     err = zmq_recv(skt, ok, 2, 0)
     if err != 2:
         fprintf(stderr, "Did not recv() bytes?")
-
-    fprintf(stderr, "Here\n")
 
     # if ok[0] != "O" or ok[1] != "K":
     #     fprintf(stderr, "Unexpected response %s\n", ok)
@@ -470,7 +506,6 @@ cdef void cpp_cb(Request* request):
     err = zmq_ctx_shutdown(ctx)
     if err != 0:
         fprintf(stderr, "Error in ctx term (%i)\n", err)
-    fprintf(stderr, "Done\n")
 
 
 # Harvest upward
@@ -504,7 +539,6 @@ cdef class PyCamera:
         self._camera.get().acquire()
         # Generate a configuration that support raw stills
         # NOTE(meawoppl) - the example I am following uses this, but lib barfs when I add "StillCapture" and "Raw", so IDK
-        # self.config = self.camera.generateConfiguration([StreamRole.StillCapture, StreamRole.Raw])   
         self._camera_cfg = self._camera.get().generateConfiguration([StreamRole.StillCapture])   
         assert self._camera_cfg.get() != NULL
 
@@ -525,6 +559,10 @@ cdef class PyCamera:
         assert self._camera != NULL      
         cdef ControlList cl = self._camera.get().properties()
         return self._decode_control_list(cl)
+
+    cdef _log_control_list(self, ControlList cl):
+        dec = self._decode_control_list(cl)
+        self._log.debug(pprint.pformat(dec))
 
     cdef _decode_control_list(self, ControlList cl):
         cdef const ControlIdMap* cid_map = cl.idMap()
@@ -547,7 +585,7 @@ cdef class PyCamera:
         elif c.type() == ControlTypeInteger32:
             return struct.unpack("i", data)
         elif c.type() == ControlTypeInteger64:
-            return struct.unpack("q", data)
+            return <long long> c.data().data()
         elif c.type() == ControlTypeFloat:
             return struct.unpack("f", data)
         elif c.type() == ControlTypeRectangle:
@@ -624,6 +662,12 @@ cdef class PyCamera:
         if err != 0:
             self._log.warning("Nonzero return on queueRequest(): %i", err)
 
+    def _queue_all_requests(self):
+        for i in range(self.requests.size()):
+            self._log.info(f"Queueing request {i}")
+            r = self.requests.at(i).get()
+            self._queue_request(r)
+
     def wrap_on_frame_callback(self, call: callable):
         def fb_call_and_recycle(raw_data):
             sequence, index = struct.unpack("II", raw_data)
@@ -633,50 +677,56 @@ cdef class PyCamera:
                 # These should be screened out in the cpp call...
                 self._log.warning("Request status not complete: %i", req_status)
                 return
+            self._log.debug("Frame completed callback delivered")
+            
+            self._log.debug("Controls")
+            self._log_control_list(req.controls())
+            
+            self._log.debug("Metadata")
+            self._log_control_list(req.metadata())
             
             self._log.debug("Triggering frame CB")
             call(sequence, self.mmaps[index])
+
             self._log.debug("Frame CB complete")
             self._queue_request(req)
 
         return fb_call_and_recycle
 
-    def log_zmq_version(self):
-        self._log.info(f"C ZMQ Version {ZMQ_VERSION_MAJOR}.{ZMQ_VERSION_MINOR}.{ZMQ_VERSION_PATCH}")
+    def _to_array_cb(self, seq, buff):
+        self.images.append(np.frombuffer(buff, dtype=np.uint8).reshape((1080, 1920, -1)).copy())
+
+    def get_one_frame(self):
+        self._log.info("Setup callback")
+        self._camera.get().requestCompleted.connect(cpp_cb)
+        with CallbackManager() as cbm:
+            wrapped_cb = self.wrap_on_frame_callback(lambda *args: self._log.info("Callback with %s", repr(args)))
+            cbm.add_callback(wrapped_cb)
+            
+            wrapped_cb = self.wrap_on_frame_callback(self._to_array_cb)
+            cbm.add_call_once(wrapped_cb)
+
+            self._log.info("Starting camera")
+            self._camera.get().start(NULL)
+            self._queue_all_requests()
+            time.sleep(0.5)
+            self._camera.get().stop()
+        
+        return self.images[0]
+        
 
     def run_cycle(self):
-        self.log_zmq_version()
-        self._log.info("Starting camera")
-        self._camera.get().start(NULL)
-
-        self._log.info("Starting CallbackManager")
-        cbm = CallbackManager()
-
-        wrapped_cb = self.wrap_on_frame_callback(lambda *args: self._log.info("Callback with %s", repr(args)))
-        cbm.add_callback(wrapped_cb)
-        cbm.start_callback_thread()      
-
         self._log.info("Setup callback")
-        self._camera.get().requestCompleted.connect(cpp_cb)    
+        self._camera.get().requestCompleted.connect(cpp_cb)
+        with CallbackManager() as cbm:
+            wrapped_cb = self.wrap_on_frame_callback(lambda *args: self._log.info("Callback with %s", repr(args)))
+            cbm.add_callback(wrapped_cb)
 
-        for i in range(self.requests.size()):
-            self._log.info(f"Queueing request {i}")
-            r = self.requests.at(i).get()
-            self._queue_request(r)
-
-        if False:
-            for i in range(20):
-                self._log.debug("Polling requests")
-                for r in range(self.requests.size()):
-                    status = self.requests.at(r).get().status()
-                    self._log.debug("Request %i, status: %i", r, status)
-                
-                time.sleep(0.1)
-        else:
-            time.sleep(1)
-
-        self._camera.get().stop()
-        cbm.stop_callback_thread()
+            self._log.info("Starting camera")
+            self._camera.get().start(NULL)
+            self._queue_all_requests()
+            time.sleep(0.5)
+            self._camera.get().stop()
         self._log.info("Stopped camera")
 
     def close(self):

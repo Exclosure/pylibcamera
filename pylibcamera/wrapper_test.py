@@ -4,6 +4,11 @@ import pytest
 
 import pylibcamera.wrapper
 
+# These tests are designed to work against a virtual media device
+# To build this interface
+# sudo modprobe vimc
+# media-ctl -d platform:vimc -V '"Sensor B":0[fmt:SBGGR8_1X8/640x480]'
+
 class TestLibCameraWrapper(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -39,23 +44,43 @@ class TestLibCameraWrapper(unittest.TestCase):
     def test_get_controls(self):
         self._skip_if_no_camera()
 
-        camera = self._cam_manager.get_camera(0)
-        
-        camera.configure()  
-        controls = camera.get_controls()
+        camera = self._cam_manager.get_camera_matching("vimc")
 
-        assert isinstance(controls, dict)
-        assert len(controls) >= 3
+        try:        
+            camera.configure()  
+            controls = camera.get_controls()
 
-        camera.close()
+            assert isinstance(controls, dict)
+            assert len(controls) >= 3
+        finally:
+            camera.close()
 
     def test_everything(self):
         self._skip_if_no_camera()
 
-        camera = self._cam_manager.get_camera(0)
+        camera = self._cam_manager.get_camera_matching("vimc")
 
-        camera.configure()  
-        camera.create_buffers_and_requests()
-        camera.run_cycle()
-        camera.close()
+        try:
+            camera.configure()  
+            camera.create_buffers_and_requests()
+            camera.run_cycle()
+        finally:
+            camera.close()
 
+    def test_get_one_frame(self):
+        self._skip_if_no_camera()
+
+        camera = self._cam_manager.get_camera_matching("vimc")
+
+        from PIL import Image
+        try:
+            camera.configure()  
+            camera.create_buffers_and_requests()
+
+            img = camera.get_one_frame()
+            # There are seven color bars in the vimc test image
+            assert len(set(img[::4, 500, 1].flatten().tolist())) == 7
+
+            Image.fromarray(img).save("test.png")
+        finally:
+            camera.close()
